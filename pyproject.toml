@@ -1,0 +1,9 @@
+[project]
+name = "uae-ocr-api"
+version = "1.0.0"
+description = "UAE National ID, passport and visa OCR API built on Gemini vision."
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

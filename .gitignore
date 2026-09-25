@@ -1,0 +1,9 @@
+.env
+ocr-dev-venv/
+.venv/
+__pycache__/
+.pytest_cache/
+logs/
+detections/
+
+postman_output/
