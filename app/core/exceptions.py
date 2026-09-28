@@ -15,7 +15,9 @@ from app.services.post_processing import error_response
 
 logger = logging.getLogger("uae_ocr")
 
-OCR_PATH = "/ocr"
+API_V1_PREFIX = "/api/v1"
+OCR_PATH = f"{API_V1_PREFIX}/ocr"
+LEASING_PATH = f"{API_V1_PREFIX}/ocr/leasing"
 
 
 class ValidationStopped(Exception):

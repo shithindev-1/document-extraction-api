@@ -2,16 +2,20 @@
 
   - `POST /ocr/leasing`         JSON body, documents named by URL - the API downloads each one.
   - `POST /ocr/leasing/upload`  multipart form-data, documents attached directly as files.
+  - `GET  /ocr/leasing/files?url=...`  view one uploaded `<name>_ocr.<ext>` result from blob storage
+                                       (also `/ocr/leasing/files/{blob path}`).
 
-Both return `LeasingOcrResponse`. See app.services.leasing for how a batch is judged.
+Both POST routes return `LeasingOcrResponse`. See app.services.leasing for how a batch is judged.
 """
 
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 
 from app.schemas.leasing import LeasingOcrRequest, LeasingOcrResponse
-from app.services.leasing import process_batch, process_sources
+from app.services.leasing import fetch_ocr_file, process_batch, process_sources
 
 router = APIRouter(prefix="/ocr/leasing", tags=["leasing"])
 
@@ -57,3 +61,33 @@ async def extract_ocr_leasing_upload(
         })
 
     return await process_batch(tenant_type=tenant_type, document_refnumber=document_refnumber, items=items)
+
+
+_FILE_RESPONSES = {200: {"content": {"image/jpeg": {}, "image/png": {}, "image/webp": {}, "application/pdf": {}}}}
+
+
+def _inline(content: bytes, content_type: str, filename: str) -> Response:
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+@router.get("/files", response_class=Response, responses=_FILE_RESPONSES)
+async def view_ocr_file_by_url(url: str) -> Response:
+    """Show one uploaded `<name>_ocr.<ext>` result - pass a source's `ocr_file` URL as `url`.
+
+    Served inline, so a browser or Postman displays the image or PDF directly.
+    """
+    return _inline(*await fetch_ocr_file(url))
+
+
+@router.get(
+    "/files/{blob_path:path}",
+    response_class=Response,
+    responses=_FILE_RESPONSES,
+)
+async def view_ocr_file(blob_path: str) -> Response:
+    """Show one uploaded `<name>_ocr.<ext>` result by its blob path inside the container."""
+    return _inline(*await fetch_ocr_file(blob_path))

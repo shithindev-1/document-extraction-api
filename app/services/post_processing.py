@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from app.schemas.ocr import (
     DATA_FIELDS,
+    DOCUMENT_TYPE_ALIASES,
     FRONT_BACK_TYPES,
     MISSING_INFO_FIELDS,
     VERIFIABLE_TYPES,
@@ -18,28 +19,7 @@ from app.schemas.ocr import (
 _FIELD_LOOKUP = {field.lower(): field for field in DATA_FIELDS}
 _SIDE_KEYS = {"front_side_visible": "front", "back_side_visible": "back"}
 _TYPES_KEY = "document_types_present"
-_TYPE_ALIASES = {
-    "nationalid": "national_id",
-    "national_identity": "national_id",
-    "emirates_id": "national_id",
-    "eid": "national_id",
-    "residence_visa": "visa",
-    "residency_visa": "visa",
-    # British spelling of the same document, which the model uses about as often as the American.
-    "trade_licence": "trade_license",
-    "business_license": "trade_license",
-    "business_licence": "trade_license",
-    "ejari": "ejari_certificate",
-    "ejari_registration": "ejari_certificate",
-    "bank_account_statement": "bank_statement",
-    "statement_of_account": "bank_statement",
-    "initialapproval": "initial_approval",
-    "initial_approval_letter": "initial_approval",
-    "salary_certificate_letter": "salary_certificate",
-    "salary_cert": "salary_certificate",
-    "tenancy_agreement": "tenancy_contract",
-    "rental_contract": "tenancy_contract",
-}
+_TYPE_ALIASES = DOCUMENT_TYPE_ALIASES
 _TRUE_VALUES = {"true", "yes", "y", "visible", "present", "1"}
 _NULL_VALUES = {
     "",

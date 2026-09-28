@@ -1,6 +1,17 @@
-# UAE OCR Development API
+# UAE OCR API
 
-A small FastAPI service for testing UAE National ID, Passport, and Visa extraction with Gemini's vision API.
+A FastAPI service that extracts UAE National ID, passport, visa and leasing-document data with Gemini's vision API, then crops, de-skews and rotates each document.
+
+| Route | Auth | Purpose |
+| --- | --- | --- |
+| `GET /health` | none | Liveness probe |
+| `POST /api/v1/ocr` | `X-API-Key` | Multipart OCR, one merged response |
+| `POST /api/v1/ocr/leasing` | `X-API-Key` | Leasing OCR, documents given as URLs (JSON) |
+| `POST /api/v1/ocr/leasing/upload` | `X-API-Key` | Leasing OCR, documents attached as files (form-data) |
+| `GET /api/v1/ocr/leasing/files?url=...` | `X-API-Key` | View an uploaded `<name>_ocr.<ext>` result |
+| `GET /docs` | none | Swagger UI (disable with `DOCS_ENABLED=false`) |
+
+`X-API-Key` is enforced whenever `API_KEYS` is set; leave it empty only for local testing.
 
 ## Setup
 
@@ -9,18 +20,21 @@ A small FastAPI service for testing UAE National ID, Passport, and Visa extracti
    ```powershell
    py -m venv .venv
    .\.venv\Scripts\Activate.ps1
-   pip install -r requirements-dev.txt
+   python -m pip install -r requirements-dev.txt
    ```
 
-   `requirements.txt` holds the runtime dependencies only; `requirements-dev.txt` adds the test tools.
+   `requirements.txt` holds the runtime dependencies only; `requirements-dev.txt` adds the test tools. Always go through `python -m ...` (`python -m pip`, `python -m pytest`, `python -m app`): Windows Application Control / Smart App Control can block the unsigned `pip.exe` and `uvicorn.exe` launchers inside `.venv\Scripts`, while the signed `python.exe` runs fine.
 
 2. Copy `.env.example` to `.env` and set `GEMINI_API_KEY` and `GEMINI_MODEL`. For local HTTP-only development, set `REQUIRE_HTTPS=false` in `.env`.
 
 3. Start the API:
 
    ```powershell
-   uvicorn app.main:app --reload
+   python -m uvicorn app.main:app --reload   # development, auto-reload
+   python -m app                             # production mode, host/port from APP_HOST/APP_PORT
    ```
+
+   Then open `http://127.0.0.1:8000/health` and `http://127.0.0.1:8000/docs`.
 
 The production API must run behind HTTPS/TLS. With `REQUIRE_HTTPS=true` (the default), `/ocr` rejects plain HTTP even if a client reaches the process directly. Terminate TLS at a reverse proxy such as IIS, nginx, or Caddy, forward `X-Forwarded-Proto: https`, and firewall the Uvicorn port so it is not internet-facing. Plain HTTP is only for local development with `REQUIRE_HTTPS=false`.
 
@@ -36,18 +50,20 @@ Every log line is stamped in three zones. The JSON logs carry `timestamp` (UTC, 
 
 ```
 app/
-  main.py                 create_app(): middleware, exception handlers, routers
+  __main__.py             `python -m app`: production entry point (Uvicorn, one worker)
+  main.py                 create_app(): middleware, CORS, exception handlers, routers
   core/
     config.py             Settings (environment variables / .env)
     logging.py            rotating log files, UTC/UAE/IST timestamps
     exceptions.py         ValidationStopped + exception handlers
-    middleware.py         HTTPS enforcement and rate limiting for POST /ocr
+    middleware.py         HTTPS enforcement and rate limiting for the OCR endpoints
+    security.py           X-API-Key authentication for /api/v1
   api/
-    router.py             collects every route
+    router.py             /health at the root; everything else under /api/v1 behind X-API-Key
     routes/
       health.py           GET  /health
-      ocr.py              POST /ocr
-      leasing.py          POST /ocr/leasing, POST /ocr/leasing/upload
+      ocr.py              POST /api/v1/ocr
+      leasing.py          POST /api/v1/ocr/leasing, POST /api/v1/ocr/leasing/upload
   schemas/
     ocr.py                /ocr field lists and response models
     leasing.py            /ocr/leasing request and response models
@@ -58,6 +74,8 @@ app/
     leasing.py            /ocr/leasing batch processing
     post_processing.py    parse model output, build /ocr error payloads
     validation.py         upload validation and rate limiting
+    blob_storage.py       Azure Blob Storage fetch/upload for /ocr/leasing
+deploy/windows/           NSSM install / update / uninstall scripts
 tests/                    offline tests - Gemini is always stubbed
 ```
 
@@ -65,7 +83,7 @@ Run the tests with `python -m pytest -q`. They make no network calls.
 
 ## Endpoint
 
-`POST /ocr` accepts one or more `multipart/form-data` documents:
+`POST /api/v1/ocr` accepts one or more `multipart/form-data` documents:
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -73,13 +91,13 @@ Run the tests with `python -m pytest -q`. They make no network calls.
 | `documentName` | text | Display name used in errors. Repeat once per document |
 | `documentType` | text | Any type, e.g. `national_id`, `passport`, `visa`, `driving_license`, `trade_license`. Repeat once per document |
 
-`documentType` accepts **any** document type, not a fixed KYC list. The value is normalised before use — trimmed, lowercased, and spaces/hyphens converted to underscores, so `Trade License` and `trade-license` both become `trade_license` — and must be 1–50 characters of letters, digits, spaces, hyphens, or underscores, since it reaches log lines and the Gemini prompt. `national_id`, `passport`, and `visa` are the types the extraction prompt is tuned for; any other type is passed through to Gemini as-is, which will populate whichever of the fixed `data` fields it can actually read and leave the rest null.
+`documentType` accepts **any** document type, not a fixed KYC list. The value is normalised before use — trimmed, lowercased, and spaces/hyphens converted to underscores, so `Trade License` and `trade-license` both become `trade_license` — and must be 1–50 characters of letters, digits, spaces, hyphens, or underscores, since it reaches log lines and the Gemini prompt. These types are checked against what the file actually shows (and self-verified): `national_id`, `passport`, `visa`, `bank_statement`, `ejari_certificate`, `trade_license`, `tenant_form`, `initial_approval`, `salary_certificate` (also sent as Salary Statement, Salary Letter or Payslip), `tenancy_contract` and `cheque` (also Cheque Copy, Security Cheque, PDC). Common spellings are mapped to these (`DOCUMENT_TYPE_ALIASES` in [app/schemas/ocr.py](app/schemas/ocr.py)) - e.g. Emirates ID becomes `national_id`. Any other type is passed through to Gemini as-is, which will populate whichever of the fixed `data` fields it can actually read and leave the rest null.
 
 **Several documents can be sent in one request.** Repeat all three fields once per document; they are paired **by position**, so the first `documentType` belongs to the first `file`, and so on. A request whose three field counts do not match is rejected with a 400 before any document is read.
 
 **The response is always exactly one object, in exactly the schema a single document has always used — never an array, never a new key, no matter how many documents were uploaded.** Each document is validated in upload order — file checks, type match, front/back completeness, self-verification — and the moment any one of them fails, the whole request stops right there: the response is `data` emptied and the reason in `errorInfo`, exactly as a single bad document has always reported it, and any document after the failing one in upload order is never even read. Only once every uploaded document has individually passed does cross-verification run across all of them (see **Validation**); a conflict there stops the request the same way. Only once the whole batch has cleared every one of those gates, including cross-verification, does the crop/rotate pipeline run at all, for every document at once — an error anywhere in the batch, on any document, means none of them is ever cropped or rotated, even one earlier in upload order that had already individually passed. Only then are every document's own fields folded into that one response — a National ID's `National_Id`, a passport's `Passport_Number`, a visa's `Visa_Number`, all landing in the same `data` object beside each other, first non-null value in upload order for any field two documents both happen to supply. A file-validation problem or a provider error (a corrupt file, an unsupported type, Gemini unavailable) keeps its own HTTP status code (400/413/502) exactly as a single-document request always has, whichever document in the list it came from; a type mismatch, an incomplete document, a self-verification finding, or a cross-verification conflict all answer `200` with the problem in `errorInfo`, also unchanged from the single-document contract. Request-level rejections — HTTPS, rate limit, malformed multipart, mismatched field counts — still answer with one error envelope at their own status code, whatever the document count.
 
-**A National ID/passport/visa's front and back no longer have to be in the same file.** If two files in the same batch share a `documentType` from `FRONT_BACK_TYPES` and each is individually missing a side — one shows only the front, the other only the back — the pipeline holds them instead of rejecting either outright: `GeminiService.verify_document_pair` looks at both images and confirms they are genuinely the same document (not two different people's uploads that happen to share a type and a missing side), then the two original files are combined into one PDF and re-extracted as a single document, going through every remaining gate — completeness, self-verification, cross-verification, cropping — exactly as a normal single-file upload would. This only ever resolves the single, unambiguous case: exactly one file showing only the front and exactly one showing only the back. Three or more incomplete uploads of the same type, or two that show the same side, cannot be matched automatically and are rejected with a clear `errorInfo` explaining why, rather than guessing. A pairing confirmed by Gemini but rejected — the two images turn out not to be the same document — is also reported as an error, the same way every other validation finding is. None of this adds a key to the response: the combined result reads exactly like a single well-formed upload's `data` always has. The combined, cropped/rotated document is written to `DETECTION_OUTPUT_DIR` with a `_merged.pdf` suffix — the API response itself never carries a file.
+**A National ID's front and back no longer have to be in the same file.** If two files in the same batch share a `documentType` from `FRONT_BACK_TYPES` and each is individually missing a side — one shows only the front, the other only the back — the pipeline holds them instead of rejecting either outright: `GeminiService.verify_document_pair` looks at both images and confirms they are genuinely the same document (not two different people's uploads that happen to share a type and a missing side), then the two original files are combined into one PDF and re-extracted as a single document, going through every remaining gate — completeness, self-verification, cross-verification, cropping — exactly as a normal single-file upload would. This only ever resolves the single, unambiguous case: exactly one file showing only the front and exactly one showing only the back. Three or more incomplete uploads of the same type, or two that show the same side, cannot be matched automatically and are rejected with a clear `errorInfo` explaining why, rather than guessing. A pairing confirmed by Gemini but rejected — the two images turn out not to be the same document — is also reported as an error, the same way every other validation finding is. None of this adds a key to the response: the combined result reads exactly like a single well-formed upload's `data` always has. The combined, cropped/rotated document is written to `DETECTION_OUTPUT_DIR` with a `_merged.pdf` suffix — the API response itself never carries a file.
 
 Documents can be uploaded in any order. There is no requirement to send a National ID first.
 
@@ -89,7 +107,7 @@ Optional headers: `X-Tenant-ID`, `X-User-ID`, `X-Request-ID`, `X-Detection` (`on
 
 The extension, declared MIME type, and file signature must agree. PDFs are parsed with strict mode and encrypted, corrupt, empty, or unreadable files are rejected. Images are decoded and verified with Pillow.
 
-**The front/back requirement applies only to `national_id`, `passport`, and `visa`** (`FRONT_BACK_TYPES` in [app/schemas/ocr.py](app/schemas/ocr.py)). Page or file count alone can't prove front/back presence — both sides routinely share a single page, and a two-page file can just as easily be the same side twice — so completeness for those three is Gemini's own call: it reports `Front_Side_Visible`/`Back_Side_Visible` after reading the file. A file missing a side is no longer rejected on the spot: `main.py` holds it and checks whether another file in the same batch, of the same type, supplies the complementary side (see **Endpoint** above) — only once that possibility is ruled out, or a candidate pairing is confirmed and the merged file is *still* incomplete, is `data` dropped and the incomplete error reported. Every other document type — tenancy contract, Ejari certificate, trade licence, and so on — is complete as submitted: a single page is never rejected, and a stray `documentComplete=false` from Gemini is ignored rather than turned into an error, so the rule is enforced in code as well as in the prompt.
+**The front/back requirement applies only to `national_id`** - a passport or visa is complete with just its details page (`FRONT_BACK_TYPES` in [app/schemas/ocr.py](app/schemas/ocr.py)). Page or file count alone can't prove front/back presence — both sides routinely share a single page, and a two-page file can just as easily be the same side twice — so completeness for a National ID is Gemini's own call: it reports `Front_Side_Visible`/`Back_Side_Visible` after reading the file. A file missing a side is no longer rejected on the spot: the pipeline holds it and checks whether another file in the same batch, of the same type, supplies the complementary side (see **Endpoint** above) — only once that possibility is ruled out, or a candidate pairing is confirmed and the merged file is *still* incomplete, is `data` dropped and the incomplete error reported. Every other document type — tenancy contract, Ejari certificate, trade licence, and so on — is complete as submitted: a single page is never rejected, and a stray `documentComplete=false` from Gemini is ignored rather than turned into an error, so the rule is enforced in code as well as in the prompt.
 
 Oversized uploads are downscaled before the extraction call. The API rejects any image whose longest edge exceeds 8000px with a 400 (which surfaced as a `502 OCR provider unavailable`), and it internally scales anything above ~1568px down regardless, so a larger original buys no extra detail. `downscale_image_for_api` caps the longest edge at `GEMINI_MAX_IMAGE_EDGE` (1568), re-encoding as JPEG and updating the declared media type to match; PDFs pass through untouched, since their pages are rasterised server-side and are not subject to the pixel limit. A resize failure is logged and the original bytes are sent anyway rather than failing the request. Set it to `0` to disable. The box-detection and orientation calls were never affected — they already downscale to 1024px — and cropping still works from the full-resolution original, so output quality is unchanged.
 
@@ -105,13 +123,13 @@ Both checks below are Gemini's own judgment, not a Python rule engine, and neith
 
 **Self-verification** runs for every document that reaches extraction as the type it was selected as, before the crop/rotate pipeline is even considered — the crop/rotate pipeline never runs per document at all; it only runs once, across the whole batch, after every document has individually passed *and*, for a batch, cross-verification has too (see below). `GeminiService.verify_document` shows the document image to Gemini a second time and asks it to check what the extraction call itself doesn't: completeness and legibility, required fields actually present and readable, ID/reference number formats, date logic (an issue date before its own expiry, a period's start before its end), whether the document is expired as of today, and internal consistency (a machine-readable zone against the printed text, a front side against a back side, or any other value the document contradicts itself on). Because this call looks at the actual image rather than this service's own narrow `data` fields, it can flag a problem on a bank statement, trade license, or cheque just as well as on a National ID, even though this API never extracts most of those documents' own fields into `data`. If it finds anything, the whole request stops there: `data` is emptied, the crop/rotate pipeline never runs for this document or any other in the batch, and no document later in upload order is even read. Every message it writes is one plain sentence for the person who uploaded the document, not a verification report — no jargon ("MRZ", field names, raw codes) — and every one of them must both say what's wrong and show the actual values that make it wrong: *"The name on the front and back don't match: Ahmed Khan vs Ahmad Khan"*, never a bare verdict like "the name is inconsistent" with nothing to check it against. A date-related finding names both dates, including today's own date — e.g. *"The passport shows an expiry of 12 May 2023, which is before today, 23 September 2026"* — so any finding is checkable at a glance instead of taken on faith. The same rule applies to cross-verification's own findings. It is explicitly told not to flag the document being upside down, sideways, or tilted — that's the crop/rotate pipeline's job (see below), not a real defect — and not to mistake the small greyscale "ghost" photo and day/month stamp on a UAE Emirates ID (part of the holder's own date of birth, printed as a security feature) for a second date that ought to match the card's issuing or expiry date. Unlike extraction, this call and cross-verification both run with a small thinking budget rather than none — comparing values is a judgment call, not a direct transcription, and benefits from the model actually working through it instead of answering in one shot.
 
-An **incomplete front/back document** (see **Endpoint** above) is checked after every document in the batch has been extracted and type-matched, before self-verification or detection ever run. A National ID, passport, or visa missing its required other side is not an immediate problem if another file in the same batch, of the same type, supplies it — that pairing is confirmed by Gemini and the two are merged into one document first (see **Endpoint**). Only a document nothing else in the batch can complete, or an ambiguous group of incomplete uploads, or a pairing Gemini does not confirm, stops the request; self-verification and detection are never spent on any of those.
+An **incomplete front/back document** (see **Endpoint** above) is checked after every document in the batch has been extracted and type-matched, before self-verification or detection ever run. A National ID missing its required other side is not an immediate problem if another file in the same batch, of the same type, supplies it — that pairing is confirmed by Gemini and the two are merged into one document first (see **Endpoint**). Only a document nothing else in the batch can complete, or an ambiguous group of incomplete uploads, or a pairing Gemini does not confirm, stops the request; self-verification and detection are never spent on any of those.
 
 **Cross-verification** runs only when two or more documents were uploaded and every one of them individually cleared type-matching, completeness, *and* self-verification — by the time this stage runs, there is nothing left in the group for it to exclude; a single document skips this stage entirely, since there is nothing to compare it against. `GeminiService.verify_documents_cross` sends Gemini the fields already extracted from every one of them - labelled by `documentName` - on the explicit assumption that every uploaded document belongs to the same person or tenant, and asks it to find every case where two disagree about what should be the same fact: the same person's name, date of birth, nationality, gender, or identifying numbers; the same contact, employment, company, property, tenancy, or financial detail; any of it, whenever it is actually present on two or more of the uploaded documents. A National ID for one person and a Visa for someone else entirely is exactly the case this catches — the prompt is explicit that a name/DOB/ID mismatch is never dismissed as "two unrelated documents". For names specifically, it first checks whether one is just a shorter or longer version of the other — a passport omitting a middle or maternal name a National ID includes is the same person at a different level of detail, not a conflict — and only reports a name finding when a component present on both is genuinely different, or the names share nothing meaningful at all. Any conflict found stops the request the same way as every other stage - `data` stays empty and the conflict is reported in `errorInfo`, and the crop/rotate pipeline never runs for any of the documents in the batch, even ones that had already individually passed. This is the last validation stage in the pipeline; only once it, too, has cleared does the crop/rotate pipeline run at all.
 
 ## Postman
 
-Create a `POST` request to `https://api.example.com/ocr` in production. Use `http://127.0.0.1:8000/ocr` only when `REQUIRE_HTTPS=false` for local testing.
+Create a `POST` request to `https://api.example.com/api/v1/ocr` in production. Use `http://127.0.0.1:8000/api/v1/ocr` only when `REQUIRE_HTTPS=false` for local testing. When `API_KEYS` is set, add the header `X-API-Key: <key>`.
 
 In **Body > form-data**, add:
 
@@ -137,7 +155,8 @@ To send several documents at once — merged into one response, and cross-verifi
 Equivalent curl request (single document):
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:8000/ocr `
+curl.exe -X POST http://127.0.0.1:8000/api/v1/ocr `
+  -H "X-API-Key: <key>" `
   -F "file=@C:\docs\national-id-front-back.pdf" `
   -F "documentName=National ID" `
   -F "documentType=national_id"
@@ -146,7 +165,8 @@ curl.exe -X POST http://127.0.0.1:8000/ocr `
 And for two documents in one request, which merges both into the one JSON object below (`National_Id` from the first file, `Passport_Number` from the second, both beside each other):
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:8000/ocr `
+curl.exe -X POST http://127.0.0.1:8000/api/v1/ocr `
+  -H "X-API-Key: <key>" `
   -F "file=@C:\docs\national-id-front-back.pdf" `
   -F "documentName=National ID" `
   -F "documentType=national_id" `
@@ -157,7 +177,7 @@ curl.exe -X POST http://127.0.0.1:8000/ocr `
 
 ## Response contract
 
-Every successful Gemini result is normalized to exactly the requested top-level keys. `missingInfo` contains only the specified snake_case names whose corresponding `data` values are null. An incomplete front/back document — only possible for `national_id`, `passport`, and `visa` — adds an `errorInfo` object with `DocumentName`, `DocumentFileName`, `DocumentError`, and `DocumentErrorToShow`.
+Every successful Gemini result is normalized to exactly the requested top-level keys. `missingInfo` contains only the specified snake_case names whose corresponding `data` values are null. An incomplete front/back document — only possible for `national_id` — adds an `errorInfo` object with `DocumentName`, `DocumentFileName`, `DocumentError`, and `DocumentErrorToShow`.
 
 `success` reflects whether *any* field was actually extracted — it is `true` as soon as one `data` value is non-null (partial extraction still counts, and for several uploaded documents, so does one contributing a field another didn't), and `false` when every `data` value is null, whether that's because Gemini read the document(s) but found nothing usable, or because a problem anywhere in the pipeline stopped before any data was kept (rejected file, type mismatch, incomplete document, self- or cross-verification finding, rate limit, internal error). It is derived automatically from `data` on every `OcrResponse` (see `_derive_success` in [app/schemas/ocr.py](app/schemas/ocr.py)), not set independently by each response builder — it does not indicate whether the HTTP call itself succeeded, which is what the status code is for.
 
@@ -218,6 +238,44 @@ The defaults are intentionally data-minimizing and are configured in `.env`:
 Do not enable request-body logging in IIS, nginx, Uvicorn, Postman, or any monitoring agent. If business requirements require persistence, use encrypted storage with a documented deletion job and access audit.
 
 **Extracted-data logging is currently enabled for development/testing.** `app/services/gemini.py`'s `_log_result` call writes each hit's full parsed result (including extracted KYC values such as National ID, DOB, passport/visa numbers) to `logs/results.log`, keyed by `hit_id`. This contradicts the 0-second retention goal above and the "extracted KYC values are never written to logs" claim earlier in this doc. Before any production or shared-environment use, either comment out the `self._log_result(hit_id, parsed)` call in [app/services/gemini.py](app/services/gemini.py) again, or move `logs/results.log` to encrypted storage with a documented deletion job and restricted access, matching the persistence guidance above.
+
+## Deployment (Windows VM with NSSM)
+
+The service runs as a Windows service through [NSSM](https://nssm.cc), which starts it at boot and restarts it after a crash. On the VM, in an **elevated** PowerShell:
+
+1. Install the prerequisites: Python 3.12+ (python.org installer, "Add to PATH"), Git, and NSSM (`winget install NSSM.NSSM` or `choco install nssm`, or download nssm.exe and pass `-NssmPath`).
+2. Clone and configure:
+
+   ```powershell
+   git clone <repo-url> C:\apps\uae-ocr-api
+   cd C:\apps\uae-ocr-api
+   copy .env.example .env
+   notepad .env
+   ```
+
+   Set at least `GEMINI_API_KEY`, `GEMINI_MODEL`, `API_KEYS` (a long random value per client, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`), `AZURE_STORAGE_*` if the leasing endpoints use blob storage, and `DOCS_ENABLED=false` if the host is internet-facing.
+3. Install and start the service:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File deploy\windows\install-service.ps1
+   ```
+
+   This creates `.venv`, installs `requirements.txt`, and registers the `UaeOcrApi` service (auto start, restart on exit after 5 s, console output in `logs\service-stdout.log` / `logs\service-stderr.log`, rotated at 10 MB). Rerunning it reinstalls the service cleanly.
+4. Check it: `Invoke-RestMethod http://127.0.0.1:8000/health` should return `{"status":"ok"}`.
+
+**Exposing it.** Keep `APP_HOST=127.0.0.1` and put IIS (URL Rewrite + ARR), nginx or Caddy in front for TLS, with `REQUIRE_HTTPS=true` and the proxy forwarding `X-Forwarded-Proto`. `FORWARDED_ALLOW_IPS` must list the proxy's IP (`127.0.0.1` when it runs on the same VM), or the forwarded scheme is ignored and every request is rejected as plain HTTP. Raise the proxy's request-body limit to at least `MAX_FILE_SIZE_MB` times the number of files per request, and its timeout above `GEMINI_TIMEOUT_SECONDS`. Only for a closed internal network with no proxy: set `APP_HOST=0.0.0.0` and `REQUIRE_HTTPS=false`, and open the port in Windows Firewall (`New-NetFirewallRule -DisplayName "UAE OCR API" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow`).
+
+**Day to day:**
+
+| Task | Command |
+| --- | --- |
+| Deploy the latest `main` | `powershell -ExecutionPolicy Bypass -File deploy\windows\update-service.ps1` |
+| Status / restart / stop | `nssm status UaeOcrApi` · `nssm restart UaeOcrApi` · `nssm stop UaeOcrApi` |
+| Changed `.env` | `nssm restart UaeOcrApi` (settings are read at startup) |
+| Startup errors | `Get-Content logs\service-stderr.log -Tail 50` |
+| Remove the service | `powershell -ExecutionPolicy Bypass -File deploy\windows\uninstall-service.ps1` |
+
+The service runs one worker on purpose: the rate limiter and per-request usage tracking live in process memory.
 
 ## Production operations
 

@@ -133,10 +133,11 @@ Standard FastAPI layout - routes stay thin, the work lives in `app/services/`:
 - `app/main.py` — `create_app()`: logging, `OcrSecurityMiddleware`, exception handlers, routers.
 - `app/core/` — `config.py` (Settings, instantiated at import), `logging.py` (six log files, three
   timezones per line), `exceptions.py` (`ValidationStopped` + the handlers that give `/ocr` its
-  errorInfo error shape), `middleware.py` (HTTPS + rate limit, exact path `/ocr` only).
-- `app/api/routes/` — `health.py`, `ocr.py` (`POST /ocr`: request ID, `X-Detection`/`X-Validation`
-  overrides, field-count checks, then `run_ocr_batch`), `leasing.py` (`POST /ocr/leasing` and
-  `/ocr/leasing/upload`, both `response_model=LeasingOcrResponse`).
+  errorInfo error shape), `middleware.py` (HTTPS + rate limit for `/api/v1/ocr` and the leasing
+  endpoints), `security.py` (`X-API-Key` check on every `/api/v1` route; off when `API_KEYS` is empty).
+- `app/api/routes/` — `health.py` (unversioned, no key), `ocr.py` (`POST /api/v1/ocr`: request ID, `X-Detection`/`X-Validation`
+  overrides, field-count checks, then `run_ocr_batch`), `leasing.py` (`POST /api/v1/ocr/leasing`
+  and `/api/v1/ocr/leasing/upload`, both `response_model=LeasingOcrResponse`).
 - `app/schemas/` — `ocr.py` (DATA_FIELDS, FRONT_BACK_TYPES, OcrResponse), `leasing.py`.
 - `app/services/gemini.py` — every model call (extraction, box detection, orientation,
   self-/cross-verification, front/back pairing confirmation), prompts, schemas, usage logging.

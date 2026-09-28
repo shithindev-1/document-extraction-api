@@ -4,44 +4,41 @@ This is the same OCR pipeline as the existing `ocr_dev_gemini` project - extract
 pairing and merging, self-verification, cross-verification, cropping, rotation - reachable through
 two new endpoints on the same running app:
 
-- **`POST /ocr/leasing/upload`** - multipart **form-data**, documents attached directly as files in
+- **`POST /api/v1/ocr/leasing/upload`** - multipart **form-data**, documents attached directly as files in
   Postman, several at once. **Use this one** - it's what the rest of this guide walks through.
-- **`POST /ocr/leasing`** - JSON body, documents named by URL instead (the API downloads them
+- **`POST /api/v1/ocr/leasing`** - JSON body, documents named by URL instead (the API downloads them
   itself) - covered at the end, in case you need it later.
 
 Both return the exact same response shape. See `app/services/leasing.py` for exactly what either does and
-does not change; the original `POST /ocr` (the existing multipart endpoint) still works exactly as
+does not change; the original `POST /api/v1/ocr` (the existing multipart endpoint) still works exactly as
 before, untouched.
 
 ## 1. Set up
 
 ```powershell
-cd gemini_ocr_postman
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements-dev.txt
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
 ```
 
-Copy your own `GEMINI_API_KEY`/`GEMINI_MODEL` into `.env` (an example, with the real values already
-in this ZIP's own `.env`, is in `.env.example`) - if you extracted this ZIP somewhere new, check
-`.env` came along and still has a real key in it.
+Copy `.env.example` to `.env` and fill in your own `GEMINI_API_KEY`/`GEMINI_MODEL`. `.env` is never
+committed to git.
 
 ## 2. Run the server
 
 ```powershell
-uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
-Leave `require_https` as `false` for local testing (already set in `.env`), otherwise the API will
-reject a plain `http://localhost` request from Postman. Note: the existing HTTPS and
-rate-limit checks (`OcrSecurityMiddleware`) only ever look at the exact path `/ocr`, so they do not
-apply to either new route - both exist purely for local testing. Say if you need either check added
-back for these too.
+Set `REQUIRE_HTTPS=false` in `.env` for local testing, otherwise the API rejects a plain
+`http://localhost` request from Postman. The HTTPS and rate-limit checks apply to every route under
+`/api/v1/ocr`, leasing included. If `API_KEYS` is set, add an `X-API-Key: <key>` header to every
+request (Postman: **Headers** tab).
 
 ## 3. Set up the request in Postman (form-data, multiple files)
 
 - **Method**: `POST`
-- **URL**: `http://localhost:8000/ocr/leasing/upload`
+- **URL**: `http://localhost:8000/api/v1/ocr/leasing/upload`
 - **Body tab** → select **form-data**
 
 Add these rows. `file` is type **File** (click the dropdown on the right of the key field to switch
@@ -137,7 +134,7 @@ plus a passport:
 }
 ```
 
-A failure - here `/ocr/leasing` with an empty `source` URL:
+A failure - here `/api/v1/ocr/leasing` with an empty `source` URL:
 
 ```json
 {
@@ -218,10 +215,10 @@ output - the two `<document_id>_<document_name>/` folders each still keep their 
   problem (wrong document type, a missing side with no matching pair, a self- or cross-verification
   finding) - same as the existing endpoint, just reported in this response shape instead.
 
-## Alternative: JSON body with URLs (`POST /ocr/leasing`)
+## Alternative: JSON body with URLs (`POST /api/v1/ocr/leasing`)
 
 If a document is already hosted somewhere reachable and you'd rather send its URL than attach the
-file itself, `POST /ocr/leasing` takes the same request shape you originally described, as raw JSON
+file itself, `POST /api/v1/ocr/leasing` takes the same request shape you originally described, as raw JSON
 (Content-Type: application/json, set automatically by Postman for "raw" + "JSON" body):
 
 ```json
@@ -230,7 +227,7 @@ file itself, `POST /ocr/leasing` takes the same request shape you originally des
   "document_refnumber": "93ade000-37d4-41f0-bbc7-422dcbe46ad0",
   "sources": [
     {
-      "source": "https://softspacestorage.blob.core.windows.net/realestateapp-applicationfiles-uat/ApplicationFiles/LeasingRequestOCR/1/93ade000-37d4-41f0-bbc7-422dcbe46ad0/Nationalid 1.jpg",
+      "source": "https://<account>.blob.core.windows.net/<container>/ApplicationFiles/LeasingRequestOCR/1/93ade000-37d4-41f0-bbc7-422dcbe46ad0/Nationalid 1.jpg",
       "document_id": "16",
       "document_type": "National Id",
       "document_name": "Nationalid1"

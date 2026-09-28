@@ -12,6 +12,7 @@ from fastapi import HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
 from pypdf import PdfReader
 from app.core.config import Settings
+from app.schemas.ocr import canonical_document_type
 
 ALLOWED_FILES = {
     ".jpg": "image/jpeg",
@@ -108,7 +109,9 @@ def validate_document_request(
 ) -> ValidatedDocument:
     # Any document type is accepted, not a fixed KYC whitelist. The value is normalised and
     # charset-restricted because it reaches log lines and the Gemini prompt.
-    normalized_type = document_type.strip().lower().replace(" ", "_").replace("-", "_")
+    normalized_type = canonical_document_type(
+        document_type.strip().lower().replace(" ", "_").replace("-", "_")
+    )
     if not _safe_document_type.fullmatch(normalized_type):
         raise _file_error("documentType must be 1-50 characters using letters, digits, spaces, hyphens, or underscores")
     if not 1 <= len(document_name.strip()) <= 100 or any(ord(char) < 32 for char in document_name):

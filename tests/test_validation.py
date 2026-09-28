@@ -141,3 +141,28 @@ def test_rate_limit_rejects_after_configured_count() -> None:
     with pytest.raises(HTTPException) as error:
         enforce_rate_limit("rate-test", settings)
     assert error.value.status_code == 429
+
+
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [
+        ("Cheque", "cheque"),
+        ("Cheque Copy", "cheque"),
+        ("Security-Cheque", "cheque"),
+        ("Salary Statement", "salary_certificate"),
+        ("Salary Certificate", "salary_certificate"),
+        ("Payslip", "salary_certificate"),
+        ("Emirates ID", "national_id"),
+        ("nationalid", "national_id"),
+        ("Utility Bill", "utility_bill"),  # unknown types pass through unchanged
+    ],
+)
+def test_declared_type_is_normalised_to_its_checked_spelling(declared: str, expected: str) -> None:
+    validated = validate_document_request(
+        file=_upload("doc.png", "image/png", _png()),
+        content=_png(),
+        document_name="Doc",
+        document_type=declared,
+        settings=_settings(),
+    )
+    assert validated.document_type == expected

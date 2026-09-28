@@ -26,6 +26,11 @@ class SourceReport(BaseModel):
     document_name: str | None
     document_type: str = Field(..., description="The document type exactly as it was sent.")
     pages: list[int] = Field(..., description="Page numbers read from this source; [] if it was never read.")
+    ocr_file: str | None = Field(
+        None,
+        description="Full blob URL of the uploaded cropped/rotated result (<name>_ocr.<ext>, beside the "
+                    "original); null when the source is not in blob storage or nothing was uploaded.",
+    )
 
 
 class DocumentReport(BaseModel):

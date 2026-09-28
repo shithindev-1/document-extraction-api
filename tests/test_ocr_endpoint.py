@@ -81,7 +81,7 @@ _ORIGINAL_KEYS = {"success", "userName", "tenantType", "subscriptionId", "ocrRef
 
 def test_single_document_still_answers_with_one_object(client: TestClient, extractions: list[dict[str, Any]]) -> None:
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("passport.png")],
         data={"documentName": "A. Rahman passport", "documentType": "passport"},
     )
@@ -109,7 +109,7 @@ def test_multiple_documents_merge_into_one_object_with_every_respective_key_fill
     monkeypatch.setattr(get_gemini_service(), "extract", fake_extract)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id.png"), _file("passport.png"), _file("visa.png")],
         data={
             "documentName": ["ID", "Passport", "Visa"],
@@ -140,7 +140,7 @@ def test_a_type_mismatch_stops_the_whole_request_with_blank_data(
     monkeypatch.setattr(get_gemini_service(), "extract", fake_extract)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("visa.png"), _file("mislabelled.png")],
         data={"documentName": ["Visa", "ID"], "documentType": ["visa", "national_id"]},
     )
@@ -160,9 +160,9 @@ def test_incomplete_front_back_document_stops_the_whole_request(
     monkeypatch.setattr(settings, "detection_enabled", True)
 
     async def fake_extract(**kwargs: Any) -> dict[str, Any]:
-        if kwargs["document_type"] == "passport":
-            return _raw(["passport"], complete=False, Tenant_Name_En="Holder", Passport_Number="P1")
-        return _raw([kwargs["document_type"]], Tenant_Name_En="Holder")
+        if kwargs["document_type"] == "national_id":
+            return _raw(["national_id"], complete=False, front_visible=True, back_visible=False, Tenant_Name_En="Holder")
+        return _raw([kwargs["document_type"]], Tenant_Name_En="Holder", Passport_Number="P1")
 
     detection_calls: list[Any] = []
 
@@ -173,7 +173,7 @@ def test_incomplete_front_back_document_stops_the_whole_request(
     monkeypatch.setattr(ocr_pipeline, "run_detection", fake_detection)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id.png"), _file("passport.png")],
         data={"documentName": ["ID", "Passport"], "documentType": ["national_id", "passport"]},
         headers={"X-Detection": "on"},
@@ -184,9 +184,9 @@ def test_incomplete_front_back_document_stops_the_whole_request(
     assert payload["success"] is False
     assert all(value is None for value in payload["data"].values())
     assert "FRONT and BACK" in payload["errorInfo"][0]["DocumentError"]
-    # Detection only ever runs once the whole batch has cleared every gate. The passport's
-    # incompleteness stops the request before that point, so the National ID that came before it
-    # in upload order - and already passed on its own - is never cropped or rotated either.
+    # Detection only ever runs once the whole batch has cleared every gate. The National ID's
+    # incompleteness stops the request before that point, so the passport - which passed on its
+    # own - is never cropped or rotated either.
     assert not detection_calls
 
 
@@ -216,7 +216,7 @@ def test_front_and_back_uploaded_separately_are_merged_into_one_document(
     monkeypatch.setattr(get_gemini_service(), "verify_document", no_issues)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id_front.png"), _file("id_back.png")],
         data={"documentName": ["ID Front", "ID Back"], "documentType": ["national_id", "national_id"]},
         headers={"X-Validation": "on"},
@@ -250,7 +250,7 @@ def test_pairing_rejected_by_the_model_stops_the_request(
     monkeypatch.setattr(get_gemini_service(), "verify_document_pair", fake_pair)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id_front.png"), _file("id_back.png")],
         data={"documentName": ["ID Front", "ID Back"], "documentType": ["national_id", "national_id"]},
         headers={"X-Validation": "on"},
@@ -281,7 +281,7 @@ def test_ambiguous_incomplete_pair_is_rejected_without_a_pairing_call(
     monkeypatch.setattr(get_gemini_service(), "verify_document_pair", fake_pair)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id_a.png"), _file("id_b.png")],
         data={"documentName": ["ID A", "ID B"], "documentType": ["national_id", "national_id"]},
     )
@@ -294,13 +294,12 @@ def test_ambiguous_incomplete_pair_is_rejected_without_a_pairing_call(
     assert not pair_calls
 
 
-def test_a_lone_incomplete_document_is_never_treated_as_ambiguous(
+def test_a_one_sided_passport_beside_a_merged_national_id_is_complete(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Regression: a National ID's front and back uploaded separately (a real, resolvable pair)
-    # alongside a single, genuinely one-sided Passport (nothing else in the batch claims to be a
-    # Passport at all) must report the Passport as a plain incomplete document - not as an
-    # "ambiguous pair" just because it, too, happens to show only one side.
+    # Only a National ID needs both sides. A National ID's front and back uploaded separately (a
+    # real, resolvable pair) alongside a passport showing a single page must merge the ID and
+    # accept the passport as it is - never report it incomplete or as part of an "ambiguous pair".
     monkeypatch.setattr(settings, "validation_enabled", True)
 
     async def fake_extract(**kwargs: Any) -> dict[str, Any]:
@@ -308,7 +307,7 @@ def test_a_lone_incomplete_document_is_never_treated_as_ambiguous(
         if filename.endswith("_merged.pdf"):
             return _raw(["national_id"], complete=True, Tenant_Name_En="Ahmed")
         if kwargs["document_type"] == "passport":
-            return _raw(["passport"], complete=False, front_visible=True, back_visible=False)
+            return _raw(["passport"], complete=False, front_visible=True, back_visible=False, Passport_Number="P1")
         if "front" in filename:
             return _raw(["national_id"], complete=False, front_visible=True, back_visible=False)
         return _raw(["national_id"], complete=False, front_visible=False, back_visible=True)
@@ -316,11 +315,16 @@ def test_a_lone_incomplete_document_is_never_treated_as_ambiguous(
     async def fake_pair(**kwargs: Any) -> bool:
         return True
 
+    async def no_issues(**kwargs: Any) -> list[str]:
+        return []
+
     monkeypatch.setattr(get_gemini_service(), "extract", fake_extract)
     monkeypatch.setattr(get_gemini_service(), "verify_document_pair", fake_pair)
+    monkeypatch.setattr(get_gemini_service(), "verify_document", no_issues)
+    monkeypatch.setattr(get_gemini_service(), "verify_documents_cross", no_issues)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id_front.png"), _file("id_back.png"), _file("passport_front.png")],
         data={
             "documentName": ["ID Front", "ID Back", "Passport"],
@@ -331,9 +335,10 @@ def test_a_lone_incomplete_document_is_never_treated_as_ambiguous(
 
     payload = response.json()
     assert response.status_code == 200
-    assert payload["success"] is False
-    assert "FRONT and BACK are required in the same file" in payload["errorInfo"][0]["DocumentErrorToShow"]
-    assert "could not be automatically matched" not in payload["errorInfo"][0]["DocumentError"]
+    assert payload["success"] is True
+    assert payload["errorInfo"] == []
+    assert payload["data"]["Tenant_Name_En"] == "Ahmed"
+    assert payload["data"]["Passport_Number"] == "P1"
 
 
 def test_self_verification_failure_stops_the_whole_request(
@@ -358,7 +363,7 @@ def test_self_verification_failure_stops_the_whole_request(
     monkeypatch.setattr(ocr_pipeline, "run_detection", fake_detection)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("passport.png")],
         data={"documentName": "Passport", "documentType": "passport"},
         headers={"X-Validation": "on", "X-Detection": "on"},
@@ -387,7 +392,7 @@ def test_self_verification_failure_is_swallowed_when_the_call_itself_breaks(
     monkeypatch.setattr(get_gemini_service(), "verify_document", failing_verify)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("passport.png")],
         data={"documentName": "Passport", "documentType": "passport"},
         headers={"X-Validation": "on"},
@@ -422,7 +427,7 @@ def test_cross_verification_conflict_stops_the_whole_request(
     monkeypatch.setattr(get_gemini_service(), "verify_documents_cross", fake_cross)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id.png"), _file("passport.png")],
         data={"documentName": ["ID", "Passport"], "documentType": ["national_id", "passport"]},
         headers={"X-Validation": "on"},
@@ -460,7 +465,7 @@ def test_detection_runs_for_every_document_only_after_the_batch_clears(
     monkeypatch.setattr(ocr_pipeline, "run_detection", fake_detection)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id.png"), _file("passport.png")],
         data={"documentName": ["ID", "Passport"], "documentType": ["national_id", "passport"]},
         headers={"X-Validation": "on", "X-Detection": "on"},
@@ -496,7 +501,7 @@ def test_cross_verification_conflict_never_runs_detection(
     monkeypatch.setattr(ocr_pipeline, "run_detection", fake_detection)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("id.png"), _file("passport.png")],
         data={"documentName": ["ID", "Passport"], "documentType": ["national_id", "passport"]},
         headers={"X-Validation": "on", "X-Detection": "on"},
@@ -532,7 +537,7 @@ def test_cross_verification_does_not_run_for_a_single_document(
     monkeypatch.setattr(get_gemini_service(), "verify_documents_cross", fake_cross)
 
     client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("passport.png")],
         data={"documentName": "Passport", "documentType": "passport"},
         headers={"X-Validation": "on"},
@@ -545,7 +550,7 @@ def test_a_bad_file_stops_the_whole_request_with_its_original_status_code(
     client: TestClient, extractions: list[dict[str, Any]]
 ) -> None:
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("good.png"), _file("corrupt.png", b"not a png at all"), _file("also_good.png")],
         data={
             "documentName": ["First", "Second", "Third"],
@@ -564,7 +569,7 @@ def test_a_bad_file_stops_the_whole_request_with_its_original_status_code(
 
 def test_single_document_rejection_keeps_its_status_code(client: TestClient, extractions: list[dict[str, Any]]) -> None:
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("corrupt.png", b"not a png at all")],
         data={"documentName": "Tenant ID", "documentType": "national_id"},
     )
@@ -580,7 +585,7 @@ def test_unpaired_fields_are_rejected_before_any_model_call(
     client: TestClient, extractions: list[dict[str, Any]]
 ) -> None:
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("one.png"), _file("two.png")],
         data={"documentName": ["Only one name"], "documentType": ["passport", "visa"]},
     )
@@ -606,7 +611,7 @@ def test_x_validation_header_off_skips_the_verification_call(client: TestClient,
     monkeypatch.setattr(get_gemini_service(), "verify_document", fake_verify)
 
     response = client.post(
-        "/ocr",
+        "/api/v1/ocr",
         files=[_file("passport.png")],
         data={"documentName": "Passport", "documentType": "passport"},
         headers={"X-Validation": "off"},

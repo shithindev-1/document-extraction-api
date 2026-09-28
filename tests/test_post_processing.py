@@ -120,24 +120,24 @@ def test_document_complete_false_is_ignored_for_types_without_a_front_back_pair(
 def test_incomplete_document_gets_error_info() -> None:
     response = normalize_response(
         {"documentComplete": False, "data": {}},
-        document_name="Passport",
-        document_filename="passport.jpg",
-        document_type="passport",
+        document_name="Emirates ID",
+        document_filename="eid_front.jpg",
+        document_type="national_id",
     )
 
     assert len(response["errorInfo"]) == 1
-    assert response["errorInfo"][0]["DocumentName"] == "Passport"
+    assert response["errorInfo"][0]["DocumentName"] == "Emirates ID"
 
 
 def test_incomplete_document_drops_whatever_was_extracted() -> None:
-    # A one-sided passport still yields real field values from the side that was visible - the
-    # front's Passport_Number, say. Reporting "incomplete" alongside those values would let a
-    # caller quietly use data from a document the API itself flagged as not good enough.
+    # A one-sided National ID still yields real field values from the side that was visible - the
+    # front's National_Id, say. Reporting "incomplete" alongside those values would let a caller
+    # quietly use data from a document the API itself flagged as not good enough.
     response = normalize_response(
-        {"documentComplete": False, "data": {"Tenant_Name_En": "Jane Doe", "Passport_Number": "C2323323"}},
-        document_name="Passport",
-        document_filename="passport.jpg",
-        document_type="passport",
+        {"documentComplete": False, "data": {"Tenant_Name_En": "Jane Doe", "National_Id": "784-1985-1234567-1"}},
+        document_name="Emirates ID",
+        document_filename="eid_front.jpg",
+        document_type="national_id",
     )
 
     assert response["success"] is False
@@ -293,3 +293,46 @@ def test_type_mismatch_takes_precedence_over_incomplete_document() -> None:
 
     assert len(response["errorInfo"]) == 1
     assert "does not match" in response["errorInfo"][0]["DocumentError"]
+
+
+@pytest.mark.parametrize("document_type", ["passport", "visa"])
+def test_one_sided_passport_or_visa_is_complete(document_type: str) -> None:
+    # Only a National ID needs both sides; a passport or visa showing just its details page is
+    # extracted and returned as-is, whatever the model reported about a back side.
+    response = normalize_response(
+        {"documentComplete": False, "data": {"Tenant_Name_En": "Jane Doe", "Passport_Number": "C2323323"}},
+        document_name="Doc",
+        document_filename="doc.jpg",
+        document_type=document_type,
+    )
+
+    assert response["errorInfo"] == []
+    assert response["data"]["Passport_Number"] == "C2323323"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Document_Types_Present: cheque", ["cheque"]),
+        ("Document_Types_Present: check", ["cheque"]),
+        ("Document_Types_Present: security cheque, passport", ["cheque", "passport"]),
+        ("Document_Types_Present: salary statement", ["salary_certificate"]),
+        ("Document_Types_Present: payslip", ["salary_certificate"]),
+    ],
+)
+def test_cheque_and_salary_spellings_are_recognised(line: str, expected: list[str]) -> None:
+    assert parse_extraction_text(_extraction(line))["documentTypesPresent"] == expected
+
+
+@pytest.mark.parametrize(
+    ("requested", "present", "matches"),
+    [
+        ("cheque", ["cheque"], True),
+        ("cheque", ["bank_statement"], False),
+        ("cheque", ["other"], False),
+        ("salary_certificate", ["salary_certificate"], True),
+        ("salary_certificate", ["passport"], False),
+    ],
+)
+def test_cheque_and_salary_certificate_are_type_checked(requested: str, present: list[str], matches: bool) -> None:
+    assert document_type_matches(requested, present) is matches

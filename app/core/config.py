@@ -1,11 +1,33 @@
 """Application settings, loaded from environment variables and `.env`."""
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# The project root, so `.env` is found no matter which directory the process starts in - a Windows
+# service (NSSM) does not necessarily start in the project folder.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 class Settings(BaseSettings):
+    # Server - read by `python -m app`, the entry point the Windows service runs.
+    app_host: str = "127.0.0.1"
+    app_port: int = 8000
+    # Reverse proxies whose X-Forwarded-* headers are trusted (comma-separated IPs, or "*").
+    forwarded_allow_ips: str = "127.0.0.1"
+    # Swagger UI at /docs and the schema at /openapi.json. Turn off on an internet-facing host.
+    docs_enabled: bool = True
+    # Comma-separated keys accepted in the X-API-Key header on /api/v1 routes. Empty = auth off.
+    api_keys: str = ""
+    # Comma-separated browser origins allowed to call the API. Empty = no CORS headers.
+    cors_origins: str = ""
+
     gemini_api_key: str
     gemini_model: str
     gemini_max_tokens: int = 2048
@@ -49,8 +71,21 @@ class Settings(BaseSettings):
     # Where the /ocr/leasing endpoints write each request's originals, crops and merged PDFs,
     # one folder per document_refnumber.
     leasing_output_dir: str = "postman_output"
+    # Azure Blob Storage for /ocr/leasing: sources are fetched from this container and each
+    # document's cropped/rotated result is uploaded back beside its original as <name>_ocr.<ext>.
+    # Both unset = blob storage off (sources must then be plain downloadable URLs).
+    azure_storage_connection_string: str | None = None
+    azure_storage_container: str | None = None
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=PROJECT_ROOT / ".env", env_file_encoding="utf-8", extra="ignore")
+
+    @property
+    def api_key_list(self) -> list[str]:
+        return _csv(self.api_keys)
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return _csv(self.cors_origins)
 
 
 @lru_cache

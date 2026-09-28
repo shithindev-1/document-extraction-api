@@ -23,13 +23,14 @@ DATA_FIELDS = [
     "Visa_Expiry",
 ]
 
-# Only these identity documents carry a mandatory front/back pair. Every other document type is
-# complete as submitted, so a single-page upload of one must never raise an incomplete error.
-FRONT_BACK_TYPES = frozenset({"national_id", "passport", "visa"})
+# Only a National ID carries a mandatory front/back pair. Every other document type - passport and
+# visa included - is complete as submitted, so a single-page upload of one never raises an
+# incomplete error.
+FRONT_BACK_TYPES = frozenset({"national_id"})
 
 # Every type the extraction pass is taught to recognise by name, and therefore every type whose
 # selection can be checked against what the file actually shows. These are exactly the values the
-# client's document-type choices send. A caller may still send some other string - "salary_certificate", say -
+# client's document-type choices send. A caller may still send some other string - "utility_bill", say -
 # which the model has no name for; those are accepted as declared rather than guessed at, because
 # rejecting on an observation the model was never asked to make would fail valid uploads.
 VERIFIABLE_TYPES = frozenset({
@@ -43,7 +44,54 @@ VERIFIABLE_TYPES = frozenset({
     "initial_approval",
     "salary_certificate",
     "tenancy_contract",
+    "cheque",
 })
+
+# Other spellings of the VERIFIABLE_TYPES, keyed by their normalised form (lowercase, underscores).
+# Applied both to the type a caller declares and to the types the model reports, so "Salary
+# Statement", "Emirates ID" or "Cheque Copy" are checked as salary_certificate, national_id and
+# cheque rather than slipping through as unknown types.
+DOCUMENT_TYPE_ALIASES = {
+    "nationalid": "national_id",
+    "national_identity": "national_id",
+    "emirates_id": "national_id",
+    "eid": "national_id",
+    "residence_visa": "visa",
+    "residency_visa": "visa",
+    # British spelling of the same document, which the model uses about as often as the American.
+    "trade_licence": "trade_license",
+    "business_license": "trade_license",
+    "business_licence": "trade_license",
+    "ejari": "ejari_certificate",
+    "ejari_registration": "ejari_certificate",
+    "bank_account_statement": "bank_statement",
+    "statement_of_account": "bank_statement",
+    "initialapproval": "initial_approval",
+    "initial_approval_letter": "initial_approval",
+    "salary_certificate_letter": "salary_certificate",
+    "salary_cert": "salary_certificate",
+    "salary_statement": "salary_certificate",
+    "salary_letter": "salary_certificate",
+    "salary_slip": "salary_certificate",
+    "salary_transfer_letter": "salary_certificate",
+    "payslip": "salary_certificate",
+    "pay_slip": "salary_certificate",
+    "tenancy_agreement": "tenancy_contract",
+    "rental_contract": "tenancy_contract",
+    "check": "cheque",
+    "cheques": "cheque",
+    "bank_cheque": "cheque",
+    "cheque_copy": "cheque",
+    "security_cheque": "cheque",
+    "post_dated_cheque": "cheque",
+    "postdated_cheque": "cheque",
+    "pdc": "cheque",
+}
+
+
+def canonical_document_type(document_type: str) -> str:
+    """The one spelling a type is checked under, e.g. "salary_statement" -> "salary_certificate"."""
+    return DOCUMENT_TYPE_ALIASES.get(document_type, document_type)
 
 MISSING_INFO_FIELDS = [
     "tenant_name_en",

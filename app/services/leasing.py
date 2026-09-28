@@ -18,14 +18,21 @@ How a batch is judged:
     stops the request at that document.
   - `document_name` must be unique within a request: it is how a merged front/back result is traced
     back to its two original documents.
-  - Output files (originals, crops, merged PDF) are written under `settings.leasing_output_dir`
-    only, never listed in the response.
+  - Output files (originals, crops, merged PDF) are written under `settings.leasing_output_dir`.
+  - A source inside the configured blob container (a path like "ApplicationFiles/.../Passport.jpg",
+    or a full URL into that container) is fetched from blob storage, and - only when the whole
+    request passed - its cropped/rotated result is uploaded back into the same folder as
+    `<name>_ocr.<ext>`, reported in that source's `ocr_file` as its full blob URL. One crop keeps the original's image
+    format; several crops become one PDF; a merged front/back pair uploads one PDF named after the
+    front. A failed upload is reported on its document and fails the request.
 """
 
 import asyncio
 import logging
+import posixpath
 import re
 import time
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -33,11 +40,13 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
+from PIL import Image
 
 from app.core.config import settings
 from app.core.exceptions import ValidationStopped
 from app.schemas.leasing import LeasingOcrRequest, SourceDocument
 from app.schemas.ocr import DATA_FIELDS, MISSING_INFO_FIELDS
+from app.services.blob_storage import BlobStorage, BlobStorageError, get_blob_storage
 from app.services.detection import run_detection, save_merged_document
 from app.services.gemini import get_gemini_service, start_usage_tracking
 from app.services.ocr_pipeline import (
@@ -58,6 +67,8 @@ _CONTENT_TYPE_EXTENSIONS = {
     "image/webp": ".webp",
     "application/pdf": ".pdf",
 }
+# Pillow format names for an _ocr result that keeps its original's image type.
+_IMAGE_FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP"}
 
 
 def _safe_name(value: str) -> str:
@@ -110,6 +121,43 @@ async def _download_source(client: httpx.AsyncClient, source: SourceDocument) ->
     return content, filename, content_type
 
 
+async def _download_blob(
+    storage: BlobStorage, blob_path: str, source: SourceDocument,
+) -> tuple[bytes, str, str]:
+    """Fetches one source from blob storage. Returns (content, filename, content_type) exactly
+    like `_download_source`, so the rest of the batch cannot tell the two apart."""
+    try:
+        content, stored_type = await storage.download(
+            blob_path, max_bytes=settings.max_file_size_mb * 1024 * 1024,
+        )
+    except BlobStorageError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Failed to fetch document from '{source.source}': {exc}",
+        ) from exc
+    filename = posixpath.basename(blob_path) or f"{_safe_name(source.document_name)}.bin"
+    extension = posixpath.splitext(filename)[1].lower()
+    # The extension wins over whatever Content-Type the blob was stored with (often a generic
+    # application/octet-stream); validate_document_request still checks the real bytes.
+    content_type = ALLOWED_FILES.get(extension) or (stored_type or "").split(";")[0].strip().lower()
+    return content, filename, content_type
+
+
+def ensure_unique_document_names(names: list[str]) -> None:
+    """Rejects a request that reuses a document_name - names are how a merged front/back result and
+    every per-document error are traced back to the right upload, so a repeat would be ambiguous."""
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for name in names:
+        if name in seen and name not in duplicates:
+            duplicates.append(name)
+        seen.add(name)
+    if duplicates:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Each document_name must be unique within a request; repeated: {', '.join(duplicates)}",
+        )
+
+
 def _document_folder(refnumber: str, document_id: str, document_name: str) -> Path:
     folder = _output_root() / _safe_name(refnumber) / f"{_safe_name(document_id)}_{_safe_name(document_name)}"
     folder.mkdir(parents=True, exist_ok=True)
@@ -136,6 +184,7 @@ def _new_report(item: dict[str, Any]) -> dict[str, Any]:
             "document_name": item["document_name"],
             "document_type": item["document_type"],
             "pages": [],
+            "ocr_file": None,
         }],
         "error": None,
     }
@@ -253,6 +302,77 @@ async def _resolve_pairs_per_type(
                 except ValidationStopped as lone:
                     documents_report[index]["error"] = _first_error_message(lone.response)
     return resolved
+
+
+def _ocr_output(image_paths: list[Path], original_extension: str) -> tuple[bytes, str, str]:
+    """Builds the uploaded result from a document's final cropped/rotated PNGs.
+
+    Returns (content, extension, content_type). One crop keeps the original's own image format
+    (a .jpg stays a .jpg); several crops - a PDF's pages, or two cards found in one photo - become
+    one PDF, a page per crop, since a single image file cannot hold more than one.
+    """
+    images = [Image.open(path) for path in image_paths]
+    buffer = BytesIO()
+    image_format = _IMAGE_FORMATS.get(original_extension)
+    if len(images) == 1 and image_format:
+        image = images[0].convert("RGB") if image_format == "JPEG" else images[0]
+        image.save(buffer, format=image_format, **({"quality": 95} if image_format == "JPEG" else {}))
+        return buffer.getvalue(), original_extension, ALLOWED_FILES[original_extension]
+    pages = [image.convert("RGB") for image in images]
+    pages[0].save(buffer, format="PDF", save_all=True, append_images=pages[1:])
+    return buffer.getvalue(), ".pdf", "application/pdf"
+
+
+def _ocr_blob_path(blob_path: str, extension: str) -> str:
+    """ApplicationFiles/.../Passport.jpg -> ApplicationFiles/.../Passport_ocr.jpg (same folder)."""
+    folder, _, name = blob_path.rpartition("/")
+    renamed = f"{posixpath.splitext(name)[0]}_ocr{extension}"
+    return f"{folder}/{renamed}" if folder else renamed
+
+
+async def _upload_ocr_result(blob_path: str, crop_paths: list[Path], merged_pdf: Path | None) -> str:
+    """Uploads one document's result beside its original and returns its full blob URL."""
+    storage = get_blob_storage()
+    if storage is None:
+        raise BlobStorageError("blob storage is not configured")
+    if merged_pdf is not None:
+        content, extension, content_type = merged_pdf.read_bytes(), ".pdf", "application/pdf"
+    else:
+        extension = posixpath.splitext(blob_path)[1].lower()
+        content, extension, content_type = await asyncio.to_thread(_ocr_output, crop_paths, extension)
+    target = _ocr_blob_path(blob_path, extension)
+    await storage.upload(target, content, content_type)
+    return storage.url(target)
+
+
+_OCR_FILE_NAME = re.compile(r"_ocr\.(jpe?g|png|webp|pdf)$", re.IGNORECASE)
+# A merged or multi-page result is a PDF of full-resolution crops - allow well past the upload limit.
+_MAX_OCR_FILE_BYTES = 100 * 1024 * 1024
+
+
+async def fetch_ocr_file(ocr_file: str) -> tuple[bytes, str, str]:
+    """Reads one uploaded `<name>_ocr.<ext>` result back out of blob storage, for viewing.
+
+    `ocr_file` is either the full blob URL a response's `ocr_file` carries, or the blob path
+    inside the container. Returns (content, content_type, filename). Only `_ocr` results are
+    served - never an original upload or any other blob in the container.
+    """
+    storage = get_blob_storage()
+    if storage is None:
+        raise HTTPException(status_code=503, detail="Blob storage is not configured")
+    path = storage.blob_path(ocr_file)
+    if path is None:
+        raise HTTPException(status_code=400, detail="Only files inside the configured blob container can be viewed")
+    filename = posixpath.basename(path)
+    if ".." in path.split("/") or not _OCR_FILE_NAME.search(filename):
+        raise HTTPException(status_code=400, detail="Only processed <name>_ocr.<ext> files can be viewed")
+    try:
+        content, _ = await storage.download(path, max_bytes=_MAX_OCR_FILE_BYTES)
+    except BlobStorageError as exc:
+        raise HTTPException(
+            status_code=404 if exc.not_found else 502, detail=f"Could not read '{path}': {exc}",
+        ) from exc
+    return content, ALLOWED_FILES[posixpath.splitext(filename)[1].lower()], filename
 
 
 def _merged_indices(document: dict[str, Any], index_by_name: dict[str, int]) -> list[int]:
@@ -420,12 +540,13 @@ async def process_batch(
                     documents_report[index]["error"] = f"{existing}; {issue}" if existing else issue
             return _failed()
 
-    # 5. Everything passed - crop, rotate, build merged PDFs, fill form_data.
+    # 5. Everything passed - crop, rotate, build merged PDFs, upload _ocr results, fill form_data.
     merged_pairs: list[tuple[int, int, str]] = []
     for document in extracted:
         is_merged = bool(document.get("is_merged_pair"))
+        upload_indices = _merged_indices(document, index_by_name)
         if is_merged:
-            front_index, back_index = _merged_indices(document, index_by_name)
+            front_index, back_index = upload_indices
             merged_pairs.append((front_index, back_index, document["document_type"]))
             output_dir = _merged_folder(
                 document_refnumber, items[front_index]["document_id"], items[back_index]["document_id"],
@@ -433,6 +554,8 @@ async def process_batch(
         else:
             output_dir = _document_folder(document_refnumber, document["_document_id"], document["document_name"])
 
+        saved_paths: list[Path] | None = None
+        merged_pdf: Path | None = None
         if settings.detection_enabled:
             per_document_settings = settings.model_copy(update={"detection_output_dir": str(output_dir)})
             saved_paths = await run_detection(
@@ -445,7 +568,7 @@ async def process_batch(
                 gemini_service=get_gemini_service(),
             )
             if is_merged and saved_paths:
-                await asyncio.to_thread(
+                merged_pdf = await asyncio.to_thread(
                     save_merged_document,
                     saved_paths,
                     output_dir=output_dir,
@@ -453,6 +576,23 @@ async def process_batch(
                     sha256=document["sha256"],
                 )
         del document["content"]
+
+        # A merged pair uploads one PDF beside the front's original; the back's source row points
+        # at that same file.
+        blob_path = items[upload_indices[0]].get("blob_path")
+        if blob_path and saved_paths:
+            try:
+                ocr_path = await _upload_ocr_result(blob_path, saved_paths, merged_pdf)
+            except BlobStorageError as exc:
+                message = f"Failed to upload processed file for '{blob_path}': {exc}"
+                for index in upload_indices:
+                    documents_report[index]["error"] = message
+                continue
+            for index in upload_indices:
+                documents_report[index]["sources"][0]["ocr_file"] = ocr_path
+
+    if any(report["error"] for report in documents_report):
+        return _failed()
 
     merged_data = merge_extracted_data(extracted)
     log_request_usage(request_id, "success", settings.detection_enabled)
@@ -468,6 +608,7 @@ async def process_sources(request: LeasingOcrRequest) -> dict[str, Any]:
     A source that cannot be downloaded gets the reason in its own `error`; every other source is
     still downloaded and checked in full, exactly as if it had been uploaded.
     """
+    ensure_unique_document_names([source.document_name for source in request.sources])
     started_at = time.perf_counter()
     items: list[dict[str, Any]] = [
         {
@@ -476,10 +617,25 @@ async def process_sources(request: LeasingOcrRequest) -> dict[str, Any]:
         }
         for source in request.sources
     ]
+    storage = get_blob_storage()
     async with httpx.AsyncClient() as client:
         for source, item in zip(request.sources, items):
+            blob_path = storage.blob_path(source.source) if storage else None
             try:
-                content, filename, content_type = await _download_source(client, source)
+                if blob_path:
+                    content, filename, content_type = await _download_blob(storage, blob_path, source)
+                    item["blob_path"] = blob_path
+                elif not source.source.lower().startswith(("http://", "https://")):
+                    reason = (
+                        "not a file path inside the configured blob container, or an http(s) URL"
+                        if storage else
+                        "blob storage is not configured, so only a full http(s) URL can be used"
+                    )
+                    raise HTTPException(
+                        status_code=400, detail=f"Failed to fetch document from '{source.source}': {reason}",
+                    )
+                else:
+                    content, filename, content_type = await _download_source(client, source)
             except HTTPException as exc:
                 item["error"] = str(exc.detail)
                 continue
