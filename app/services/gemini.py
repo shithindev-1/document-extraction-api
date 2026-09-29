@@ -470,7 +470,8 @@ class GeminiService:
             input_breakdown = self._build_input_breakdown(source_type, input_tokens, system_tokens, prompt_tokens)
             self._log_hit(hit_id, filename, media_type, started_at, "success", usage, input_breakdown)
             self._log_token_breakdown(hit_id, filename, usage, input_breakdown)
-            self._log_result(hit_id, parsed)
+            if self.settings.log_extracted_results:
+                self._log_result(hit_id, parsed)
             return parsed
         except Exception as exc:
             log_processing(started_at, f"error:{type(exc).__name__}")

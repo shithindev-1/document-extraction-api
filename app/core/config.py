@@ -64,10 +64,17 @@ class Settings(BaseSettings):
     # internal contradictions. Same override pattern as detection_enabled: the X-Validation header
     # overrides this per request either way.
     validation_enabled: bool = True
-    document_retention_seconds: int = 0
-    extracted_data_retention_seconds: int = 0
-    api_response_retention_seconds: int = 0
+    # Files under detection_output_dir and leasing_output_dir (originals, crops, merged PDFs) older
+    # than this are deleted by a background sweep that runs at startup and then hourly. 0 = keep forever.
+    output_retention_hours: int = 24
     log_retention_days: int = 30
+    # Writes every extraction's parsed fields - National ID, DOB, passport/visa numbers - to
+    # logs/results.log. Development only: never enable where real customer documents are processed.
+    log_extracted_results: bool = False
+    # Hosts a /ocr/leasing `source` URL may point at, besides the configured blob container
+    # (comma-separated, exact hostnames). Empty = only the blob container. Stops the endpoint being
+    # used to make the server fetch arbitrary or internal addresses.
+    allowed_source_hosts: str = ""
     # Where the /ocr/leasing endpoints write each request's originals, crops and merged PDFs,
     # one folder per document_refnumber.
     leasing_output_dir: str = "postman_output"
@@ -86,6 +93,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return _csv(self.cors_origins)
+
+    @property
+    def allowed_source_host_list(self) -> list[str]:
+        return [host.lower() for host in _csv(self.allowed_source_hosts)]
 
 
 @lru_cache

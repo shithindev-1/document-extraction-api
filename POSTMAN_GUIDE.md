@@ -238,4 +238,5 @@ file itself, `POST /api/v1/ocr/leasing` takes the same request shape you origina
 
 Same response shape, same local file layout, same all-or-nothing behaviour - just add more objects
 to `sources` for multiple documents. This assumes every `source` URL is directly downloadable with a
-plain GET; if yours need a SAS token or auth header, that has to already be part of the URL you send.
+plain GET; if yours need a SAS token or auth header, that has to already be part of the URL you send. A URL outside the configured blob container is only fetched when its host is listed in
+`ALLOWED_SOURCE_HOSTS` in `.env`.

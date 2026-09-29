@@ -87,21 +87,37 @@ async def _download_source(client: httpx.AsyncClient, source: SourceDocument) ->
     segment is the filename when it has one of the four supported extensions, falling back to the
     response's Content-Type header, then to the document's own declared name as a last resort.
     """
+    host = (urlparse(source.source).hostname or "").lower()
+    if host not in settings.allowed_source_host_list:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to fetch document from '{source.source}': host '{host}' is not an allowed source",
+        )
+
+    limit = settings.max_file_size_mb * 1024 * 1024
+    too_large = HTTPException(
+        status_code=413,
+        detail=f"'{source.document_name}' exceeds the configured size limit after download",
+    )
     try:
-        response = await client.get(source.source, follow_redirects=True, timeout=60.0)
-        response.raise_for_status()
+        # No redirects: a redirect could lead anywhere, outside the allowed hosts.
+        async with client.stream("GET", source.source, follow_redirects=False, timeout=60.0) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            received = 0
+            # Stop reading the moment the limit is passed, instead of buffering an unbounded body.
+            async for chunk in response.aiter_bytes():
+                received += len(chunk)
+                if received > limit:
+                    raise too_large
+                chunks.append(chunk)
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Failed to fetch document from '{source.source}': {exc}",
         ) from exc
 
-    content = response.content
-    if len(content) > settings.max_file_size_mb * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail=f"'{source.document_name}' exceeds the configured size limit after download",
-        )
+    content = b"".join(chunks)
 
     url_name = Path(urlparse(source.source).path).name or source.document_name
     extension = Path(url_name).suffix.lower()

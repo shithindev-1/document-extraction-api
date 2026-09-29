@@ -42,7 +42,7 @@ API keys and uploaded document bytes are never written to logs. `logs/ocr-api.lo
 
 `logs/rotation.log` records one JSON line per cropped document: the rotation angle Gemini asked for, its confidence and reasoning, what OpenCV actually applied, and where on the page the crop came from — `crop_box` (the four corners in the source image's own pixels, ordered top-left, top-right, bottom-right, bottom-left, as `crop_page` consumes them), `crop_bbox` (the axis-aligned bounds) and `page_size`. No extracted values.
 
-`logs/ocr-api.log` contains every request-lifecycle entry. `logs/errors.log` duplicates only the WARNING/ERROR entries (rejections, rate-limit hits, Gemini failures, unhandled exceptions) for fast incident triage. `logs/hits.log` records one JSON line per Gemini call (`hit_id`, timestamp, filename, model, status, token counts, duration) — no extracted values. `logs/results.log` **is currently enabled** and records the full parsed extraction result per `hit_id` — see the retention-policy warning below before using this outside development. `logs/token-breakdown.log` records one JSON line per successful Gemini call splitting tokens into `image_input_tokens`/`image_output_tokens` or `pdf_input_tokens`/`pdf_output_tokens` (whichever content type that hit sent) plus `thinking_output_tokens`; Google's usage API reports one combined `input_tokens` figure per request and does not meter the image/PDF bytes separately from the prompt text, and thinking has no input-side token count, so the inapplicable fields are always `null`. All five files rotate daily and are pruned after `LOG_RETENTION_DAYS`.
+`logs/ocr-api.log` contains every request-lifecycle entry. `logs/errors.log` duplicates only the WARNING/ERROR entries (rejections, rate-limit hits, Gemini failures, unhandled exceptions) for fast incident triage. `logs/hits.log` records one JSON line per Gemini call (`hit_id`, timestamp, filename, model, status, token counts, duration) — no extracted values. `logs/results.log` is **off by default**; `LOG_EXTRACTED_RESULTS=true` makes it record the full parsed extraction result per `hit_id` — development only, see the retention policy below. `logs/token-breakdown.log` records one JSON line per successful Gemini call splitting tokens into `image_input_tokens`/`image_output_tokens` or `pdf_input_tokens`/`pdf_output_tokens` (whichever content type that hit sent) plus `thinking_output_tokens`; Google's usage API reports one combined `input_tokens` figure per request and does not meter the image/PDF bytes separately from the prompt text, and thinking has no input-side token count, so the inapplicable fields are always `null`. All five files rotate daily and are pruned after `LOG_RETENTION_DAYS`.
 
 Every log line is stamped in three zones. The JSON logs carry `timestamp` (UTC, the canonical one), `timestamp_uae` (UTC+4) and `timestamp_ist` (UTC+5:30) as separate fields; the plain-text logs render all three into their single time column. The offsets are fixed rather than looked up through `zoneinfo`, since neither zone observes DST — so the offsets are exact year-round — and Windows has no IANA database without the extra `tzdata` package. The two local stamps keep their own dates, because past 20:00 UTC the UAE and Indian dates have already rolled over.
 
@@ -221,7 +221,7 @@ Output is written to `DETECTION_OUTPUT_DIR` (`detections/` by default), named af
 
 Note this means every `/ocr` request makes two Gemini calls instead of one — extraction and box detection — which roughly doubles per-request Gemini cost and API-side rate-limit consumption, even though wall-clock latency stays close to the slower of the two since they run concurrently.
 
-**This persists a derivative of the uploaded document image to local disk**, which does not fit the "Uploaded document bytes: 0 seconds, never saved" row in the retention table below — treat `detections/` with the same handling as `logs/results.log`: encrypted storage and a documented deletion job before any production or shared-environment use, or disable this pipeline if cropped documents must never be written to disk.
+**This persists a derivative of the uploaded document image to local disk.** A background sweep deletes it after `OUTPUT_RETENTION_HOURS` (see the retention policy below); restrict access to the folder in the meantime, or disable this pipeline if cropped documents must never be written to disk.
 
 ## Retention policy
 
@@ -229,15 +229,20 @@ The defaults are intentionally data-minimizing and are configured in `.env`:
 
 | Item | Retention | Behavior |
 | --- | ---: | --- |
-| Uploaded document bytes | 0 seconds | Kept in memory only and released after validation/Gemini processing; never saved by this app |
-| Cropped document image | Indefinite | **Currently persisted** to `DETECTION_OUTPUT_DIR` (`detections/` by default) as a derivative of the uploaded image, with no automatic expiry; see the box detection/crop section above |
-| Extracted data | `LOG_RETENTION_DAYS` (30 by default) | **Currently persisted** to `logs/results.log`, see warning below |
+| Uploaded document bytes (`/api/v1/ocr`) | 0 seconds | Kept in memory only and released after validation/Gemini processing |
+| Leasing originals, crops, merged PDFs | `OUTPUT_RETENTION_HOURS` (24 by default) | Written to `LEASING_OUTPUT_DIR` (`postman_output/`), deleted by the hourly sweep |
+| Cropped document image | `OUTPUT_RETENTION_HOURS` (24 by default) | Written to `DETECTION_OUTPUT_DIR` (`detections/`), deleted by the hourly sweep |
+| Extracted data | 0 seconds | Not logged unless `LOG_EXTRACTED_RESULTS=true` (development only), in which case `logs/results.log` keeps it for `LOG_RETENTION_DAYS` |
 | API response | 0 seconds | Not cached or stored by this app |
 | Application logs | 30 days | Set `LOG_RETENTION_DAYS=30`; the local rotating handlers delete older log backups automatically |
 
 Do not enable request-body logging in IIS, nginx, Uvicorn, Postman, or any monitoring agent. If business requirements require persistence, use encrypted storage with a documented deletion job and access audit.
 
-**Extracted-data logging is currently enabled for development/testing.** `app/services/gemini.py`'s `_log_result` call writes each hit's full parsed result (including extracted KYC values such as National ID, DOB, passport/visa numbers) to `logs/results.log`, keyed by `hit_id`. This contradicts the 0-second retention goal above and the "extracted KYC values are never written to logs" claim earlier in this doc. Before any production or shared-environment use, either comment out the `self._log_result(hit_id, parsed)` call in [app/services/gemini.py](app/services/gemini.py) again, or move `logs/results.log` to encrypted storage with a documented deletion job and restricted access, matching the persistence guidance above.
+The retention sweep runs at startup and then hourly inside the service; `OUTPUT_RETENTION_HOURS=0` disables it and keeps files forever. Results uploaded to Azure Blob Storage are not touched — set a lifecycle-management rule on the container for those.
+
+**Never set `LOG_EXTRACTED_RESULTS=true` where real customer documents are processed.** It writes every extraction's National ID, DOB, and passport/visa numbers to `logs/results.log` in plain text.
+
+**Source URLs.** `POST /api/v1/ocr/leasing` only fetches from the configured blob container, plus any host listed in `ALLOWED_SOURCE_HOSTS`. Redirects are not followed and downloads stop at `MAX_FILE_SIZE_MB`, so the endpoint cannot be used to make the server reach internal addresses.
 
 ## Deployment (Windows VM with NSSM)
 
