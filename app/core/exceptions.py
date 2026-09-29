@@ -7,9 +7,10 @@ standard `{"detail": ...}` body.
 import logging
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.services.post_processing import error_response
 
@@ -18,6 +19,18 @@ logger = logging.getLogger("uae_ocr")
 API_V1_PREFIX = "/api/v1"
 OCR_PATH = f"{API_V1_PREFIX}/ocr"
 LEASING_PATH = f"{API_V1_PREFIX}/ocr/leasing"
+# Paths served before every route moved under /api/v1 - a 404 on one names its new location.
+_LEGACY_PREFIXES = ("/ocr",)
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _moved_to(path: str) -> str | None:
+    if any(path == prefix or path.startswith(prefix + "/") for prefix in _LEGACY_PREFIXES):
+        return API_V1_PREFIX + path
+    return None
 
 
 class ValidationStopped(Exception):
@@ -34,9 +47,20 @@ class ValidationStopped(Exception):
         self.response = response
 
 
-async def ocr_http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    if request.url.path != OCR_PATH:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+async def ocr_http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    path = request.url.path
+    if path != OCR_PATH:
+        detail = exc.detail
+        moved_to = _moved_to(path) if exc.status_code == 404 else None
+        if moved_to:
+            detail = f"Not Found - this endpoint has moved to {moved_to}"
+        log = logger.error if exc.status_code >= 500 else logger.warning
+        log(
+            "Request rejected method=%s path=%s status_code=%d client=%s detail=%s%s",
+            request.method, path, exc.status_code, _client_ip(request), exc.detail,
+            f" moved_to={moved_to}" if moved_to else "",
+        )
+        return JSONResponse(status_code=exc.status_code, content={"detail": detail}, headers=exc.headers)
     logger.warning("OCR request rejected status_code=%d detail=%s", exc.status_code, exc.detail)
     return JSONResponse(
         status_code=exc.status_code,
@@ -51,6 +75,11 @@ async def ocr_http_exception_handler(request: Request, exc: HTTPException) -> JS
 
 async def ocr_request_validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     if request.url.path != OCR_PATH:
+        fields = [{"loc": err.get("loc"), "type": err.get("type")} for err in exc.errors()]
+        logger.warning(
+            "Request rejected method=%s path=%s status_code=422 client=%s reason=malformed_request fields=%s",
+            request.method, request.url.path, _client_ip(request), fields,
+        )
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
     # loc/type only, never "input" — a field's raw submitted value could be arbitrarily large
     # or, for the file field, binary content, and has no place in a text log.
@@ -68,7 +97,10 @@ async def ocr_request_validation_handler(request: Request, exc: RequestValidatio
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     request_id = request.headers.get("x-request-id", "unknown")
-    logger.exception("OCR unhandled error request_id=%s error_type=%s", request_id, type(exc).__name__)
+    logger.exception(
+        "Unhandled error method=%s path=%s request_id=%s error_type=%s",
+        request.method, request.url.path, request_id, type(exc).__name__,
+    )
     if request.url.path != OCR_PATH:
         return JSONResponse(status_code=500, content={"detail": "Internal server error"})
     return JSONResponse(
@@ -82,6 +114,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 
 def register_exception_handlers(app: FastAPI) -> None:
-    app.add_exception_handler(HTTPException, ocr_http_exception_handler)
+    # Starlette's class, so routing 404/405s are caught too - FastAPI's HTTPException subclasses it.
+    app.add_exception_handler(StarletteHTTPException, ocr_http_exception_handler)
     app.add_exception_handler(RequestValidationError, ocr_request_validation_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)

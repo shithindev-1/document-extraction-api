@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from app.core.config import Settings
+from app.core.config import PROJECT_ROOT, Settings
 
 
 # Fixed offsets rather than zoneinfo: neither zone observes DST, so the offset is exact all year,
@@ -77,7 +77,8 @@ def _configure_file_logger(
 
 
 def configure_logging(settings: Settings) -> None:
-    log_directory = Path("logs")
+    # Anchored to the project root, so a service started from another directory logs in the same place.
+    log_directory = PROJECT_ROOT / "logs"
     log_directory.mkdir(exist_ok=True)
 
     _configure_file_logger(

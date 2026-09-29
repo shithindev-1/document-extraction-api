@@ -51,3 +51,26 @@ def test_https_is_enforced_on_every_ocr_route(client: TestClient, monkeypatch: p
     assert client.post(path, json={}).status_code == 400
     forwarded = client.post(path, json={}, headers={"X-Forwarded-Proto": "https"})
     assert forwarded.status_code != 400 or "HTTPS" not in forwarded.text
+
+
+def test_old_unprefixed_path_is_logged_with_its_new_location(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="uae_ocr"):
+        response = client.post("/ocr/leasing", json={})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found - this endpoint has moved to /api/v1/ocr/leasing"}
+    [record] = [r for r in caplog.records if "Request rejected" in r.getMessage()]
+    message = record.getMessage()
+    assert record.levelname == "WARNING"
+    assert "method=POST path=/ocr/leasing status_code=404" in message
+    assert "moved_to=/api/v1/ocr/leasing" in message
+
+
+def test_unknown_path_is_logged_without_a_hint(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level("WARNING", logger="uae_ocr"):
+        response = client.get("/nope")
+
+    assert response.json() == {"detail": "Not Found"}
+    assert any("path=/nope status_code=404" in r.getMessage() and "moved_to" not in r.getMessage() for r in caplog.records)
